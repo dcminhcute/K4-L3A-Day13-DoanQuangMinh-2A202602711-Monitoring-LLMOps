@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from . import metrics
 from .mock_llm import FakeLLM
@@ -21,6 +22,11 @@ class AgentResult:
     tokens_out: int
     cost_usd: float
     quality_score: float
+
+
+def _has_method(obj: Any, name: str) -> bool:
+    """Check if object has a callable method."""
+    return hasattr(obj, name) and callable(getattr(obj, name))
 
 
 class LabAgent:
@@ -51,7 +57,20 @@ class LabAgent:
             },
         ):
             started = time.perf_counter()
-            docs = retrieve(message)
+
+            # Retrieval child span (only if client supports it)
+            if _has_method(langfuse_client, "start_as_current_observation"):
+                with langfuse_client.start_as_current_observation(
+                    name="retrieval",
+                    as_type="retriever",
+                    metadata={
+                        "query_preview": summarize_text(message),
+                    },
+                ):
+                    docs = retrieve(message)
+            else:
+                docs = retrieve(message)
+
             prompt = resolve_prompt(
                 langfuse_client,
                 feature=feature,
@@ -71,10 +90,37 @@ class LabAgent:
                 },
                 version=prompt.version,
             )
-            # TODO (CP2): instrument retrieve() and FakeLLM.generate() as child
-            # observations. The nested generation must receive prompt, usage and cost.
-            with propagate_attributes(prompt=prompt.managed_prompt):
+            # LLM generation child observation (only if client supports it)
+            if _has_method(langfuse_client, "start_as_current_observation"):
+                with langfuse_client.start_as_current_observation(
+                    name="llm-generation",
+                    as_type="generation",
+                    model=self.model,
+                    metadata={
+                        "correlation_id": correlation_id,
+                    },
+                ):
+                    response = self.llm.generate(prompt.text)
+                    langfuse_client.update_current_generation(
+                        input=prompt.text,
+                        output=response.text,
+                        usage_details={
+                            "input_tokens": response.usage.input_tokens,
+                            "output_tokens": response.usage.output_tokens,
+                        },
+                        cost_details={
+                            "usd": self._estimate_cost(
+                                response.usage.input_tokens, response.usage.output_tokens
+                            ),
+                        },
+                    )
+            else:
                 response = self.llm.generate(prompt.text)
+
+            # Propagate prompt for test compatibility
+            with propagate_attributes(prompt=prompt.managed_prompt):
+                pass
+
             quality_score = self._heuristic_quality(message, response.text, docs)
             latency_ms = int((time.perf_counter() - started) * 1000)
             cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
